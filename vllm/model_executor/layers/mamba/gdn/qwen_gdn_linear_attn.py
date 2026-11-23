@@ -986,6 +986,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_prefill_checkpoint_alignment(self) -> int | None:
         return self._checkpoint_alignment
 
+    def get_prefill_chunk_alignment(self) -> int | None:
+        # The FLA chunks start at each prefill chunk's first token.
+        return FLA_CHUNK_SIZE if envs.VLLM_BATCH_INVARIANT else None
+
     def get_kv_cache_checkpoint_alignment(self, vllm_config: VllmConfig) -> int | None:
         if not self._exports_checkpoints:
             return None
