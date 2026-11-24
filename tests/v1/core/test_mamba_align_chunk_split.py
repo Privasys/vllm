@@ -27,9 +27,10 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     is_mamba_prefill_checkpoint_valid,
 )
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 
-from .utils import create_requests, new_kv_cache_group
+from .utils import create_requests, create_scheduler, mamba_layer, new_kv_cache_group
 
 pytestmark = pytest.mark.cpu_test
 
@@ -427,3 +428,40 @@ def test_junction_stop_is_floored_to_the_block_grid(resume_at: int) -> None:
         num_prefill_checkpoint_blocks=1,
     )
     assert resume_at + num_new == junction // MAMBA_BLOCK_SIZE * MAMBA_BLOCK_SIZE
+
+
+def _aligned_scheduler(alignment, max_num_batched_tokens=200):
+    spec = MambaSpec(block_size=16, shapes=((1, 1),), dtypes=(torch.float32,))
+    return create_scheduler(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=2048,
+        mamba_layer_config=mamba_layer(spec, prefill_chunk_alignment=alignment),
+    )
+
+
+@pytest.mark.parametrize("alignment", [None, 64])
+def test_prefill_chunks_end_on_the_alignment(alignment):
+    # "b" starts with the 50 tokens "a" leaves, then runs beside a's decode.
+    scheduler = _aligned_scheduler(alignment)
+    (a,) = create_requests(num_requests=1, num_tokens=150, req_ids=["a"])
+    (b,) = create_requests(num_requests=1, num_tokens=500, req_ids=["b"])
+    scheduler.add_request(a)
+    scheduler.add_request(b)
+    ends = []
+    while b.num_computed_tokens < b.num_prompt_tokens:
+        out = scheduler.schedule()
+        reqs = [scheduler.requests[r] for r in out.num_scheduled_tokens]
+        sampled = [[0] if r.num_computed_tokens >= r.num_tokens else [] for r in reqs]
+        ids = list(out.num_scheduled_tokens)
+        scheduler.update_from_output(
+            out, ModelRunnerOutput(req_ids=ids, sampled_token_ids=sampled)
+        )
+        if "b" in out.num_scheduled_tokens:
+            ends.append(min(b.num_computed_tokens, b.num_prompt_tokens))
+    aligned = all(end % 64 == 0 for end in ends[:-1])
+    assert ends[-1] == 500 and aligned == (alignment is not None), ends
+
+
+def test_budget_below_the_alignment_is_rejected():
+    with pytest.raises(ValueError, match="prefill chunk alignment"):
+        _aligned_scheduler(64, max_num_batched_tokens=32)

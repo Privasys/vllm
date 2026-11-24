@@ -471,6 +471,15 @@ class Scheduler(SchedulerInterface):
             and len(mamba_alignments) == len(mamba_params)
             else None
         )
+        self.prefill_chunk_alignment = (
+            max((p.prefill_chunk_alignment or 0 for p in mamba_params), default=0)
+            or None
+        )
+        if (self.prefill_chunk_alignment or 0) > self.max_num_scheduled_tokens:
+            raise ValueError(
+                "max_num_batched_tokens is below the prefill chunk "
+                f"alignment {self.prefill_chunk_alignment}."
+            )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -579,6 +588,17 @@ class Scheduler(SchedulerInterface):
         return max(
             1, request.num_output_placeholder_steps * self.num_sampled_tokens_per_step
         )
+
+    def _prefill_chunk_aligned_split(
+        self, request: Request, num_new_tokens: int, num_skipped_tokens: int = 0
+    ) -> int:
+        """End a non-final prefill chunk on `prefill_chunk_alignment`."""
+        assert self.prefill_chunk_alignment is not None
+        start = request.num_computed_tokens + num_skipped_tokens
+        end = start + num_new_tokens
+        if end >= max(request.num_prompt_tokens, request.num_tokens - 1):
+            return num_new_tokens
+        return max(0, end - end % self.prefill_chunk_alignment - start)
 
     def _mamba_block_aligned_split(
         self,
@@ -862,6 +882,10 @@ class Scheduler(SchedulerInterface):
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
+                    request, num_new_tokens
+                )
+            if self.prefill_chunk_alignment is not None:
+                num_new_tokens = self._prefill_chunk_aligned_split(
                     request, num_new_tokens
                 )
 
@@ -1439,6 +1463,15 @@ class Scheduler(SchedulerInterface):
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
                             pad_spec_decode = False
+                    if self.prefill_chunk_alignment is not None:
+                        num_new_tokens = self._prefill_chunk_aligned_split(
+                            request,
+                            num_new_tokens,
+                            num_new_local_computed_tokens
+                            + num_external_computed_tokens,
+                        )
+                        if num_new_tokens == 0:
+                            break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
